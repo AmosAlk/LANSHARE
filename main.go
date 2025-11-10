@@ -120,9 +120,15 @@ func runListener(senderID, username string) {
 			continue
 		}
 
+		// Clear the current input line before printing incoming messages
+		// This uses CR + ANSI clear line (\r\033[K). On modern Windows consoles
+		// ANSI sequences are supported; this avoids leaving a stray prompt '>'
+		// when a message arrives while the user is typing.
+		clearSeq := "\r\033[K"
+
 		switch msg.Type {
 		case "chat":
-			fmt.Printf("\n[%s]: %s\n> ", msg.Sender, msg.Content)
+			fmt.Printf("%s[%s]: %s\n> ", clearSeq, msg.Sender, msg.Content)
 		case "ping":
 			pong(username, senderID, msg.SenderID)
 		case "pong":
@@ -132,7 +138,7 @@ func runListener(senderID, username string) {
 				onlineMu.Unlock()
 			}
 		default:
-			fmt.Printf("\n[Unknown message type from %s]: %s> ", msg.Sender, msg.Content)
+			fmt.Printf("%s[Unknown message type from %s]: %s\n> ", clearSeq, msg.Sender, msg.Content)
 		}
 
 		//fmt.Printf("Got %s from %s\n", string(buf[:n]), remoteAddr)
