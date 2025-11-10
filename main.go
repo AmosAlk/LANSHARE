@@ -38,7 +38,7 @@ func main() {
 	time.Sleep(600 * time.Millisecond)
 	count := getUserCount()
 	names := getOnlineNames()
-	fmt.Printf("Welcome! There are %d users online: %v\n ", count, names)
+	fmt.Printf("Welcome! There are %d users online: %v\n", count, names)
 	inputLoop(senderID, username)
 }
 
@@ -122,7 +122,7 @@ func runListener(senderID, username string) {
 
 		switch msg.Type {
 		case "chat":
-			fmt.Printf("\n[%s]: %s\n>", msg.Sender, msg.Content)
+			fmt.Printf("\n[%s]: %s\n> ", msg.Sender, msg.Content)
 		case "ping":
 			pong(username, senderID, msg.SenderID)
 		case "pong":
