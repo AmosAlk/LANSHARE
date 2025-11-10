@@ -38,7 +38,7 @@ func main() {
 	time.Sleep(600 * time.Millisecond)
 	count := getUserCount()
 	names := getOnlineNames()
-	fmt.Printf("Welcome! There are %d users online: %v\n", count, names)
+	fmt.Printf("Welcome! There are %d users online: %v\n ", count, names)
 	inputLoop(senderID, username)
 }
 
