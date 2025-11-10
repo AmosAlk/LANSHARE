@@ -70,7 +70,7 @@ func inputLoop(senderID, username string) {
 			onlineUsers = make(map[string]string)
 			onlineMu.Unlock()
 			runSender(buildMessage("ping", username, senderID, "user_count"))
-			time.Sleep(250 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond)
 			fmt.Printf("Online (%d): %v\n", getUserCount(), getOnlineNames())
 			continue
 		}
@@ -122,7 +122,7 @@ func runListener(senderID, username string) {
 
 		switch msg.Type {
 		case "chat":
-			fmt.Printf("\n[%s]: %s> ", msg.Sender, msg.Content)
+			fmt.Printf("\n[%s]: %s> \n", msg.Sender, msg.Content)
 		case "ping":
 			pong(username, senderID, msg.SenderID)
 		case "pong":
