@@ -23,7 +23,7 @@ func main() {
 }
 
 func runListener() {
-	addr := net.UDPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 3000}
+	addr := net.UDPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 8080}
 	conn, err := net.ListenUDP("udp", &addr)
 	if err != nil {
 		panic(err)
