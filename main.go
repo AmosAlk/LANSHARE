@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,7 @@ type Message struct {
 
 var onlineUsers = make(map[string]string)
 var onlineMu sync.RWMutex // Protects against race conditions from Goroutines
+var useANSI = runtime.GOOS != "windows"
 
 func main() {
 	senderID := uuid.New().String()
@@ -35,7 +37,7 @@ func main() {
 	pingMessage := buildMessage("ping", username, senderID, "user_count")
 	runSender(pingMessage)
 	// Allow some time for responses to come in
-	time.Sleep(600 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	count := getUserCount()
 	names := getOnlineNames()
 	fmt.Printf("Welcome! There are %d users online: %v\n", count, names)
@@ -70,7 +72,7 @@ func inputLoop(senderID, username string) {
 			onlineUsers = make(map[string]string)
 			onlineMu.Unlock()
 			runSender(buildMessage("ping", username, senderID, "user_count"))
-			time.Sleep(600 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			fmt.Printf("Online (%d): %v\n", getUserCount(), getOnlineNames())
 			continue
 		}
@@ -97,7 +99,8 @@ func runListener(senderID, username string) {
 	addr := net.UDPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 8080}
 	conn, err := net.ListenUDP("udp", &addr)
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "Failed to listen on UDP %v: %v\n", addr, err)
+		return
 	}
 	defer conn.Close()
 
@@ -120,25 +123,45 @@ func runListener(senderID, username string) {
 			continue
 		}
 
-		// Clear the current input line before printing incoming messages
-		// This uses CR + ANSI clear line (\r\033[K). On modern Windows consoles
-		// ANSI sequences are supported; this avoids leaving a stray prompt '>'
-		// when a message arrives while the user is typing.
-		clearSeq := "\r\033[K"
-
-		switch msg.Type {
-		case "chat":
-			fmt.Printf("%s[%s]: %s\n> ", clearSeq, msg.Sender, msg.Content)
-		case "ping":
-			pong(username, senderID, msg.SenderID)
-		case "pong":
-			if msg.Content == senderID {
-				onlineMu.Lock()
-				onlineUsers[msg.SenderID] = msg.Sender
-				onlineMu.Unlock()
+		// Print incoming messages without leaving a stray prompt char.
+		// On terminals that support ANSI escape sequences we clear the
+		// current line and overwrite it. On Windows we avoid emitting
+		// raw ANSI sequences by using a simple newline-based fallback
+		// which prevents weird characters like a left-arrow + 'K'.
+		if useANSI {
+			clearSeq := "\r\033[K"
+			switch msg.Type {
+			case "chat":
+				fmt.Printf("%s[%s]: %s\n> ", clearSeq, msg.Sender, msg.Content)
+			case "ping":
+				pong(username, senderID, msg.SenderID)
+			case "pong":
+				if msg.Content == senderID {
+					onlineMu.Lock()
+					onlineUsers[msg.SenderID] = msg.Sender
+					onlineMu.Unlock()
+				}
+			default:
+				fmt.Printf("%s[Unknown message type from %s]: %s\n> ", clearSeq, msg.Sender, msg.Content)
 			}
-		default:
-			fmt.Printf("%s[Unknown message type from %s]: %s\n> ", clearSeq, msg.Sender, msg.Content)
+		} else {
+			// Fallback: print a preceding newline so the incoming message
+			// doesn't get mixed with the current prompt. This keeps output
+			// clean on Windows consoles that don't interpret ANSI escapes.
+			switch msg.Type {
+			case "chat":
+				fmt.Printf("\n[%s]: %s\n> ", msg.Sender, msg.Content)
+			case "ping":
+				pong(username, senderID, msg.SenderID)
+			case "pong":
+				if msg.Content == senderID {
+					onlineMu.Lock()
+					onlineUsers[msg.SenderID] = msg.Sender
+					onlineMu.Unlock()
+				}
+			default:
+				fmt.Printf("\n[Unknown message type from %s]: %s\n> ", msg.Sender, msg.Content)
+			}
 		}
 
 		//fmt.Printf("Got %s from %s\n", string(buf[:n]), remoteAddr)
@@ -155,7 +178,8 @@ func runSender(message Message) {
 	// Create UDP connection - we are dialing, receiver will be listening.
 	conn, err := net.DialUDP("udp", nil, &addr)
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "Failed to dial UDP %v: %v\n", addr, err)
+		return
 	}
 	// Runs ONLY AFTER main function (outer) exits.
 	defer conn.Close()
@@ -168,13 +192,15 @@ func runSender(message Message) {
 
 	data, err := json.Marshal(message)
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "Failed to marshal message: %v\n", err)
+		return
 	}
 
 	// Send the message via the connection made earlier.
 	_, err = conn.Write(data)
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "Failed to write UDP data: %v\n", err)
+		return
 	}
 }
 
