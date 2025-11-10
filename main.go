@@ -145,12 +145,13 @@ func runListener(senderID, username string) {
 				fmt.Printf("%s[Unknown message type from %s]: %s\n> ", clearSeq, msg.Sender, msg.Content)
 			}
 		} else {
-			// Fallback: print a preceding newline so the incoming message
-			// doesn't get mixed with the current prompt. This keeps output
-			// clean on Windows consoles that don't interpret ANSI escapes.
+			// Fallback: clear the current line by returning to the start and
+			// overwriting with spaces (avoids emitting ANSI sequences).
+			// Use a reasonably large width to cover most prompts.
+			clearSeq := "\r" + strings.Repeat(" ", 200) + "\r"
 			switch msg.Type {
 			case "chat":
-				fmt.Printf("\n[%s]: %s\n> ", msg.Sender, msg.Content)
+				fmt.Printf("%s[%s]: %s\n> ", clearSeq, msg.Sender, msg.Content)
 			case "ping":
 				pong(username, senderID, msg.SenderID)
 			case "pong":
@@ -160,7 +161,7 @@ func runListener(senderID, username string) {
 					onlineMu.Unlock()
 				}
 			default:
-				fmt.Printf("\n[Unknown message type from %s]: %s\n> ", msg.Sender, msg.Content)
+				fmt.Printf("%s[Unknown message type from %s]: %s\n> ", clearSeq, msg.Sender, msg.Content)
 			}
 		}
 
