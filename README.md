@@ -10,6 +10,6 @@ Features and implementation details:
 
 Plans for the future:
 1. GUI
-2. More commands
+2. More commands (including private-messaging function)
 3. TCP version. For such a simple project as this it obviously isn't necessary, but a fun proof of concept.
 4. Connecting to devices outside your LAN. Difficult, so more of a future project.
