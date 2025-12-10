@@ -27,13 +27,23 @@ type Message struct {
 	AuthTag  string
 }
 
-var onlineUsers = make(map[string]string) // Maps senderID to username
-var lastChat = make(map[string]time.Time) // Maps senderID to time of last chat message
-var onlineMu sync.RWMutex                 // Protects against race conditions from Goroutines
-var useANSI = runtime.GOOS != "windows"
+var (
+	onlineUsers  = make(map[string]string)       // senderID -> username
+	usernameToID = make(map[string]string)       // username -> senderID (for /pm)
+	userAddrs    = make(map[string]*net.UDPAddr) // senderID -> last known UDP address (IP + port 8080)
+	lastChat     = make(map[string]time.Time)    // senderID -> time of last chat message
 
-// Shared UDP connection for sending broadcast messages.
-var sendConn *net.UDPConn
+	onlineMu sync.RWMutex // Protects maps above
+
+	useANSI = runtime.GOOS != "windows"
+
+	// Shared UDP connection for sending broadcast messages.
+	sendConn *net.UDPConn
+
+	// Our own identity (shared so goroutines can see it).
+	mySenderID string
+	myUsername string
+)
 
 // Duration after which a user with no chat activity is considered "away".
 const awayAfter = 5 * time.Minute
@@ -61,12 +71,10 @@ func generateCurrentAuthTag() string {
 	return computeAuthTagForBucket(currentBucket)
 }
 
-// validAuthTag checks if the tag is valid for the current or previous minute bucket.
-// Accepting the previous bucket makes us tolerant to small clock differences.
+// validAuthTag checks if the tag is valid for the current or nearby minute bucket.
+// Accepts previous, current, and next minute to allow for minor clock skew (~±1 minute).
 func validAuthTag(tag string) bool {
 	nowBucket := time.Now().Unix() / 60
-
-	// Accept tags from previous, current, and next minute.
 	for offset := int64(-1); offset <= 1; offset++ {
 		if tag == computeAuthTagForBucket(nowBucket+offset) {
 			return true
@@ -77,19 +85,16 @@ func validAuthTag(tag string) bool {
 
 func main() {
 	// UUID for unique identification of users.
-	senderID := uuid.New().String()
-	var username string
-	fmt.Print("Choose a username: ")
-	fmt.Scanln(&username)
+	mySenderID = uuid.New().String()
 
 	// Configure address of UDP broadcast endpoint and open a single shared connection.
-	addr := net.UDPAddr{
+	bcastAddr := net.UDPAddr{
 		Port: 8080,
 		IP:   net.IPv4(255, 255, 255, 255),
 	}
-	conn, err := net.DialUDP("udp", nil, &addr)
+	conn, err := net.DialUDP("udp", nil, &bcastAddr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to dial UDP %v: %v\n", addr, err)
+		fmt.Fprintf(os.Stderr, "Failed to dial UDP %v: %v\n", bcastAddr, err)
 		return
 	}
 	// Optional attempt to set write buffer to 1024 bytes. Can be omitted as OS has a default.
@@ -99,26 +104,89 @@ func main() {
 	sendConn = conn
 	defer conn.Close()
 
-	// Separate goroutine to listen, so that sending and receiving can happen simultaneously.
-	go runListener(senderID, username)
+	// Start listener so we can receive pongs (needed for username uniqueness checks and PMs).
+	go runListener(mySenderID)
 
-	// Mutex lock used to prevent race conditions when accessing onlineUsers map.
+	// Choose username with uniqueness enforcement.
+	chooseUniqueUsername()
+
+	// Initial discovery has already run in chooseUniqueUsername, so onlineUsers is populated.
+	count := getUserCount()
+	names := getOnlineNames()
+	fmt.Printf("Welcome, %s! There are %d users online: %v\n", myUsername, count, names)
+
+	// Start consistent background discovery: periodic pings to refresh onlineUsers.
+	go periodicDiscovery()
+
+	// Finally, begin accepting user input to send messages.
+	inputLoop(mySenderID)
+}
+
+// chooseUniqueUsername prompts the user until a username is found that is not
+// currently in use by any online user (according to a discovery run).
+func chooseUniqueUsername() {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Print("Choose a username: ")
+		name, _ := reader.ReadString('\n')
+		name = strings.TrimSpace(name)
+		if name == "" {
+			fmt.Println("Username cannot be empty.")
+			continue
+		}
+
+		// Temporarily set global username so pong responses use it if needed.
+		myUsername = name
+
+		// Run a discovery (equivalent to /online) to see who is currently online.
+		discoverOnlineUsers()
+
+		// Check if any other user is already using this username.
+		taken := false
+		onlineMu.RLock()
+		for id, uname := range onlineUsers {
+			if uname == myUsername && id != mySenderID {
+				taken = true
+				break
+			}
+		}
+		onlineMu.RUnlock()
+
+		if taken {
+			fmt.Printf("Username '%s' is already in use. Please choose another.\n", myUsername)
+			continue
+		}
+
+		// Name is free.
+		break
+	}
+}
+
+// periodicDiscovery runs in a goroutine and performs discovery at fixed intervals,
+// keeping onlineUsers reasonably up to date even without manual /online.
+func periodicDiscovery() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		discoverOnlineUsers()
+	}
+}
+
+// discoverOnlineUsers clears the onlineUsers/usernameToID map, broadcasts a ping,
+// and waits briefly for pongs to repopulate the map.
+func discoverOnlineUsers() {
 	onlineMu.Lock()
 	onlineUsers = make(map[string]string)
+	usernameToID = make(map[string]string)
 	onlineMu.Unlock()
 
 	// Build and send ping message to discover other users.
-	pingMessage := buildMessage("ping", username, senderID, "user_count")
+	pingMessage := buildMessage("ping", myUsername, mySenderID, "user_count")
 	runSender(pingMessage)
 
 	// Allow some time for responses to come in.
 	time.Sleep(100 * time.Millisecond)
-	count := getUserCount()
-	names := getOnlineNames()
-	fmt.Printf("Welcome! There are %d users online: %v\n", count, names)
-
-	// Finally, begin accepting user input to send messages.
-	inputLoop(senderID, username)
 }
 
 // Unlock deferred until after return.
@@ -163,41 +231,102 @@ func getOnlineStatusLists() (active []string, away []string) {
 }
 
 // Loop which runs continuously on main thread, accepting user input to send messages.
-func inputLoop(senderID, username string) {
+func inputLoop(senderID string) {
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print("> ")
 		text, _ := reader.ReadString('\n')
 		text = strings.TrimSpace(text) // Trim newline
 
-		// Command to check for users online.
-		if text == "/online" {
-			// Race condition protection: reset list of users who have responded to this ping.
-			onlineMu.Lock()
-			onlineUsers = make(map[string]string)
-			onlineMu.Unlock()
-			// Build and send pings as before, to discover other devices.
-			runSender(buildMessage("ping", username, senderID, "user_count"))
-			time.Sleep(100 * time.Millisecond)
+		// Handle commands starting with "/"
+		if strings.HasPrefix(text, "/") {
+			// Private message: /pm <username> <message...>
+			if strings.HasPrefix(text, "/pm") {
+				handlePrivateMessage(text, senderID)
+				continue
+			}
 
-			active, away := getOnlineStatusLists()
-			fmt.Printf("Online - active (%d): %v\n", len(active), active)
-			fmt.Printf("Online - away   (%d): %v\n", len(away), away)
+			// Online list
+			if text == "/online" {
+				// Run a fresh discovery just like at startup.
+				discoverOnlineUsers()
+				active, away := getOnlineStatusLists()
+				fmt.Printf("Online - active (%d): %v\n", len(active), active)
+				fmt.Printf("Online - away   (%d): %v\n", len(away), away)
+				continue
+			}
+
+			// Help command
+			if text == "/help" {
+				fmt.Println("Available commands:")
+				fmt.Println("  /online              - Show online users, split into active and away.")
+				fmt.Println("  /pm <user> <message> - Send a private message to a specific user.")
+				fmt.Println("  /help                - Show this help text.")
+				continue
+			}
+
+			// Any other slash-prefixed input is an invalid command.
+			fmt.Println("Invalid command, write /help for valid commands.")
 			continue
 		}
+
 		// Do not send empty messages.
 		if text == "" {
 			continue
 		}
-		// If text is not a command, send as normal.
-		msg := buildMessage("chat", username, senderID, text)
+
+		// If text is not a command, send as normal broadcast chat.
+		msg := buildMessage("chat", myUsername, senderID, text)
 		runSender(msg)
 
-		// Update our own lastChat så att vi också visas som aktiva.
+		// Update our own lastChat so we show as active as well.
 		onlineMu.Lock()
 		lastChat[senderID] = time.Now()
 		onlineMu.Unlock()
 	}
+}
+
+// Parse and send a private message from the local user.
+func handlePrivateMessage(input string, senderID string) {
+	// /pm <username> <message...>
+	fields := strings.Fields(input)
+	if len(fields) < 3 {
+		fmt.Println("Usage: /pm <username> <message>")
+		return
+	}
+	targetName := fields[1]
+	messageText := strings.TrimSpace(strings.TrimPrefix(input, "/pm "+targetName))
+
+	if messageText == "" {
+		fmt.Println("Private message cannot be empty.")
+		return
+	}
+
+	onlineMu.RLock()
+	targetID, okID := usernameToID[targetName]
+	addr, okAddr := userAddrs[targetID]
+	onlineMu.RUnlock()
+
+	if !okID {
+		fmt.Printf("No online user named '%s'.\n", targetName)
+		return
+	}
+	if !okAddr {
+		fmt.Printf("User '%s' is online but has no known address yet. Try again later.\n", targetName)
+		return
+	}
+
+	// Build private message. Type "pm" is handled separately on receiver side.
+	msg := buildMessage("pm", myUsername, senderID, messageText)
+	sendPrivate(msg, addr)
+
+	// Optionally echo our own PM locally.
+	fmt.Printf("[PM to %s]: %s\n", targetName, messageText)
+
+	// Mark ourselves as active.
+	onlineMu.Lock()
+	lastChat[senderID] = time.Now()
+	onlineMu.Unlock()
 }
 
 // Helper to build a Message struct, much shorter than repeating this everywhere.
@@ -211,7 +340,7 @@ func buildMessage(msgtype, sender, senderID, content string) Message {
 }
 
 // Goroutine which listens for incoming UDP messages.
-func runListener(senderID, username string) {
+func runListener(senderID string) {
 	// 0, 0, 0, 0 means listen on all interfaces, with port 8080.
 	addr := net.UDPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 8080}
 	conn, err := net.ListenUDP("udp", &addr)
@@ -224,9 +353,7 @@ func runListener(senderID, username string) {
 	// Configuring size is optional, OS has a default buffer size.
 	buf := make([]byte, 1024)
 	for {
-		// Origin address is unused here. Could be logged if desired.
-		// SenderID from the Message struct is used for identification purposes instead.
-		n, _, err := conn.ReadFromUDP(buf)
+		n, remoteAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			fmt.Println("Error reading from UDP:", err)
 			continue
@@ -251,6 +378,15 @@ func runListener(senderID, username string) {
 			continue
 		}
 
+		// For any valid message, remember where this sender lives (for /pm).
+		// We want to send PMs to their listening port (8080), not their ephemeral send port.
+		onlineMu.Lock()
+		userAddrs[msg.SenderID] = &net.UDPAddr{
+			IP:   remoteAddr.IP,
+			Port: 8080,
+		}
+		onlineMu.Unlock()
+
 		// Cleaner output by clearing current line before printing incoming message.
 		// Windows needed a separate fix here, as it does not support ANSI escape codes by default.
 		clearSeq := "\r"
@@ -258,8 +394,7 @@ func runListener(senderID, username string) {
 			clearSeq = "\r\033[K"
 		}
 
-		// Handling of different message types accordingly. Here is where we see the benefit of using
-		// a structured common message format, rather than a separate ping struct for example.
+		// Handling of different message types accordingly.
 		switch msg.Type {
 		case "chat":
 			fmt.Printf("%s[%s]: %s\n> ", clearSeq, msg.Sender, msg.Content)
@@ -267,12 +402,19 @@ func runListener(senderID, username string) {
 			onlineMu.Lock()
 			lastChat[msg.SenderID] = time.Now()
 			onlineMu.Unlock()
+		case "pm":
+			// Private messages are unicast to us, so any "pm" we receive is for us.
+			fmt.Printf("%s[PM from %s]: %s\n> ", clearSeq, msg.Sender, msg.Content)
+			onlineMu.Lock()
+			lastChat[msg.SenderID] = time.Now()
+			onlineMu.Unlock()
 		case "ping":
-			pong(username, senderID, msg.SenderID)
+			pong(myUsername, senderID, msg.SenderID)
 		case "pong":
 			if msg.Content == senderID {
 				onlineMu.Lock()
 				onlineUsers[msg.SenderID] = msg.Sender
+				usernameToID[msg.Sender] = msg.SenderID
 				onlineMu.Unlock()
 			}
 		// Fallback for unknown message types. Should never be reached.
@@ -282,6 +424,7 @@ func runListener(senderID, username string) {
 	}
 }
 
+// Broadcast sender (to everyone on the LAN).
 func runSender(message Message) {
 	if sendConn == nil {
 		fmt.Fprintln(os.Stderr, "sendConn is not initialized")
@@ -298,10 +441,41 @@ func runSender(message Message) {
 		return
 	}
 
-	// Send the message via the shared connection.
+	// Send the message via the shared broadcast connection.
 	_, err = sendConn.Write(data)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to write UDP data: %v\n", err)
+		return
+	}
+}
+
+// Unicast sender for private messages to a specific address.
+func sendPrivate(message Message, addr *net.UDPAddr) {
+	if addr == nil {
+		fmt.Fprintln(os.Stderr, "sendPrivate: nil address")
+		return
+	}
+
+	// Attach a time-based auth tag before sending.
+	message.AuthTag = generateCurrentAuthTag()
+
+	data, err := json.Marshal(message)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to marshal private message: %v\n", err)
+		return
+	}
+
+	// Create a short-lived UDP connection to the recipient's listening port (8080).
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to dial UDP for private message %v: %v\n", addr, err)
+		return
+	}
+	defer conn.Close()
+
+	_, err = conn.Write(data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to write UDP private data: %v\n", err)
 		return
 	}
 }
